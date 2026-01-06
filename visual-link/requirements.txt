@@ -1,0 +1,10 @@
+customtkinter
+aiortc
+aiohttp
+upnpy
+requests
+pydantic
+uvicorn
+numpy
+av
+fastapi
