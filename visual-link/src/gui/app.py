@@ -1,17 +1,25 @@
 import asyncio
 import json
 import logging
+import os
 import threading
+import time
 
 import customtkinter as ctk
+from PIL import Image
+from pystray import Icon, MenuItem
 
 from src.network.discovery import UPnPHandler, get_public_ip
 from src.network.p2p import P2PConnection
 from src.network.signaling import SignalingServer, SignalingClient
-from src.proxy.forwarder import TrafficForwarder, PROXY_DATA_PREFIX, PROXY_CONN_OPEN, PROXY_CONN_CLOSE
+from src.proxy.autodetect import get_windows_proxy
+from src.proxy.forwarder import TrafficForwarder, PROXY_DATA_PREFIX, PROXY_CONN_OPEN, PROXY_CONN_CLOSE, PROXY_SETUP_HOST, PROXY_SETUP_JOIN
 
 # --- Constants ---
 SIGNALING_PORT = 28571
+
+from pystray import MenuItem, Icon
+from PIL import Image
 
 class App(ctk.CTk):
     def __init__(self):
@@ -23,6 +31,10 @@ class App(ctk.CTk):
         self.async_loop = None
         self.async_thread = None
         self.host_password = None
+        self.last_pong_received = None
+        self.proxy_settings = {}
+        self.tray_icon = None
+        self.tray_thread = None
         
         self.answer_queue = asyncio.Queue()
 
@@ -39,6 +51,7 @@ class App(ctk.CTk):
         
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         self.start_asyncio_loop()
+        self.setup_tray_icon()
 
         # ---- UI Creation ----
         self.top_frame = ctk.CTkFrame(self, height=50)
@@ -63,6 +76,39 @@ class App(ctk.CTk):
         
         self.status_bar = ctk.CTkLabel(self, text="Ready", anchor="w", font=ctk.CTkFont(size=12))
         self.status_bar.grid(row=2, column=0, padx=10, pady=(5, 10), sticky="ew")
+
+    def setup_tray_icon(self):
+        """Sets up the system tray icon."""
+        image = Image.open("src/assets/icon.png")
+        menu = (MenuItem('Show', self.show_window, default=True),
+                MenuItem('Quit', self.quit_app))
+        self.tray_icon = Icon("Visual Link", image, "Visual Link", menu)
+        
+        def run_tray():
+            self.tray_icon.run()
+
+        self.tray_thread = threading.Thread(target=run_tray, daemon=True)
+        self.tray_thread.start()
+
+    def show_window(self):
+        """Shows the main application window."""
+        self.deiconify()
+
+    def on_closing(self):
+        """Hides the window when the close button is pressed."""
+        self.withdraw()
+
+    def quit_app(self):
+        """Properly closes the application."""
+        logging.info("Application closing...")
+        if self.tray_icon:
+            self.tray_icon.stop()
+        self.run_async(self.cleanup_hosting_resources())
+        if self.async_loop:
+            self.async_loop.call_soon_threadsafe(self.async_loop.stop)
+            self.async_thread.join(timeout=2)
+        self.destroy()
+
 
     # ---- UI Configuration ----
     def _configure_host_tab(self):
@@ -108,24 +154,56 @@ class App(ctk.CTk):
     def _configure_proxy_tab(self):
         proxy_tab = self.tab_view.tab("Proxy")
         proxy_tab.grid_columnconfigure(0, weight=1)
-        proxy_tab.grid_rowconfigure(2, weight=1)
+        proxy_tab.grid_rowconfigure(3, weight=1)
 
-        info_label = ctk.CTkLabel(proxy_tab, 
+        # --- Auto-detection Frame ---
+        autodetect_frame = ctk.CTkFrame(proxy_tab)
+        autodetect_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        autodetect_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(autodetect_frame, text="System Proxy Settings:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=(10,5), sticky="w")
+        
+        self.detect_proxy_button = ctk.CTkButton(autodetect_frame, text="Detect System Proxy", command=self._detect_proxy_settings)
+        self.detect_proxy_button.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        
+        self.autodetect_status_label = ctk.CTkLabel(autodetect_frame, text="Status: Ready to detect.")
+        self.autodetect_status_label.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+
+        # --- Manual Configuration Frame ---
+        manual_frame = ctk.CTkFrame(proxy_tab)
+        manual_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+        manual_frame.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(manual_frame, text="Manual Proxy Configuration:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=(10,5), sticky="w")
+
+        ctk.CTkLabel(manual_frame, text="HTTP Proxy:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
+        self.manual_http_proxy_entry = ctk.CTkEntry(manual_frame, placeholder_text="e.g., http://user:pass@host:port")
+        self.manual_http_proxy_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+
+        ctk.CTkLabel(manual_frame, text="HTTPS Proxy:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        self.manual_https_proxy_entry = ctk.CTkEntry(manual_frame, placeholder_text="e.g., http://user:pass@host:port")
+        self.manual_https_proxy_entry.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
+        
+        self.apply_manual_proxy_button = ctk.CTkButton(manual_frame, text="Apply Manual Proxy", command=self._apply_manual_proxy)
+        self.apply_manual_proxy_button.grid(row=3, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
+
+        # --- Game Proxy Section (existing code) ---
+        game_proxy_frame = ctk.CTkFrame(proxy_tab)
+        game_proxy_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+        game_proxy_frame.grid_columnconfigure(1, weight=1)
+        
+        info_label = ctk.CTkLabel(game_proxy_frame, 
                                   text="Once connected to a peer, choose your role in the game and set the game's port.\n"
                                        "This will automatically configure the proxy for both players.",
                                   wraplength=400, justify="left")
-        info_label.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        info_label.grid(row=0, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
 
-        config_frame = ctk.CTkFrame(proxy_tab)
-        config_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-        config_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(game_proxy_frame, text="Game's LAN Port:").grid(row=1, column=0, padx=10, pady=10, sticky="w")
+        self.game_port_entry = ctk.CTkEntry(game_proxy_frame, placeholder_text="e.g., 7777 or 25565")
+        self.game_port_entry.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
 
-        ctk.CTkLabel(config_frame, text="Game's LAN Port:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        self.game_port_entry = ctk.CTkEntry(config_frame, placeholder_text="e.g., 7777 or 25565")
-        self.game_port_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
-
-        button_frame = ctk.CTkFrame(proxy_tab, fg_color="transparent")
-        button_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+        button_frame = ctk.CTkFrame(game_proxy_frame, fg_color="transparent")
+        button_frame.grid(row=2, column=0, columnspan=2, padx=10, pady=10, sticky="ew")
         button_frame.grid_columnconfigure((0, 1), weight=1)
 
         self.host_game_button = ctk.CTkButton(button_frame, text="I am HOSTING the game", command=self._start_proxy_as_host)
@@ -134,9 +212,54 @@ class App(ctk.CTk):
         self.join_game_button = ctk.CTkButton(button_frame, text="I am JOINING the game", command=self._start_proxy_as_joiner)
         self.join_game_button.grid(row=0, column=1, padx=5, pady=10, sticky="ew")
         
-        # This button will be controlled programmatically
-        self.proxy_stop_button = ctk.CTkButton(proxy_tab, text="Stop Proxy", command=self.stop_proxy, state="disabled")
-        self.proxy_stop_button.grid(row=3, column=0, padx=10, pady=20, sticky="ew")
+        self.proxy_stop_button = ctk.CTkButton(game_proxy_frame, text="Stop Proxy", command=self.stop_proxy, state="disabled")
+        self.proxy_stop_button.grid(row=3, column=0, columnspan=2, padx=10, pady=20, sticky="ew")
+
+    def _detect_proxy_settings(self):
+        self.autodetect_status_label.configure(text="Detecting...")
+        proxy_settings = get_windows_proxy()
+        if proxy_settings:
+            self.proxy_settings = proxy_settings
+            self.autodetect_status_label.configure(text=f"Detected: HTTP={proxy_settings.get('http')} | HTTPS={proxy_settings.get('https')}")
+            # Also populate manual fields for easy editing
+            self.manual_http_proxy_entry.delete(0, "end")
+            self.manual_http_proxy_entry.insert(0, proxy_settings.get('http', ''))
+            self.manual_https_proxy_entry.delete(0, "end")
+            self.manual_https_proxy_entry.insert(0, proxy_settings.get('https', ''))
+            self._apply_proxy_to_environment()
+        else:
+            self.autodetect_status_label.configure(text="No system proxy detected or proxy is disabled.")
+
+    def _apply_manual_proxy(self):
+        http_proxy = self.manual_http_proxy_entry.get()
+        https_proxy = self.manual_https_proxy_entry.get()
+        
+        self.proxy_settings = {}
+        if http_proxy:
+            self.proxy_settings['http'] = http_proxy
+        if https_proxy:
+            self.proxy_settings['https'] = https_proxy
+        
+        self._apply_proxy_to_environment()
+        self.update_status("Manual proxy settings applied.")
+
+    def _apply_proxy_to_environment(self):
+        """Sets the detected/manual proxy settings as environment variables."""
+        if not self.proxy_settings:
+            return
+            
+        logging.info(f"Applying proxy settings: {self.proxy_settings}")
+        
+        # Set environment variables for the current process
+        if 'http' in self.proxy_settings:
+            os.environ['HTTP_PROXY'] = self.proxy_settings['http']
+        if 'https' in self.proxy_settings:
+            os.environ['HTTPS_PROXY'] = self.proxy_settings['https']
+        if 'no_proxy' in self.proxy_settings:
+            os.environ['NO_PROXY'] = self.proxy_settings['no_proxy']
+        
+        self.update_status(f"Proxy applied: HTTP={self.proxy_settings.get('http','N/A')}")
+
 
     def _configure_chat_tab(self):
         chat_tab = self.tab_view.tab("Chat")
@@ -469,7 +592,14 @@ class App(ctk.CTk):
 
     # ---- APP CLEANUP ----
     def on_closing(self):
+        """Hides the window when the close button is pressed."""
+        self.withdraw()
+
+    def quit_app(self):
+        """Properly closes the application."""
         logging.info("Application closing...")
+        if self.tray_icon:
+            self.tray_icon.stop()
         self.run_async(self.cleanup_hosting_resources())
         if self.async_loop:
             self.async_loop.call_soon_threadsafe(self.async_loop.stop)
@@ -481,4 +611,7 @@ if __name__ == '__main__':
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
     app = App()
-    app.mainloop()
+    try:
+        app.mainloop()
+    except KeyboardInterrupt:
+        app.quit_app()

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaRelay
 
@@ -9,23 +10,31 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 class P2PConnection:
     """Manages a single WebRTC peer-to-peer connection."""
     
-    def __init__(self, on_message_callback=None):
+    def __init__(self, on_message_callback=None, on_connection_state_change=None):
         self.pc = RTCPeerConnection()
         self.relay = MediaRelay()
         self.data_channel = None
         self.on_message_callback = on_message_callback
+        self.on_connection_state_change = on_connection_state_change
+        self.keep_alive_task = None
+        self.last_pong_received = None
 
         @self.pc.on("datachannel")
         def on_datachannel(channel):
             logging.info(f"Data channel '{channel.label}' created by remote.")
             self.data_channel = channel
             self._register_channel_callbacks()
+            self.start_keep_alive()
 
         @self.pc.on("connectionstatechange")
         async def on_connectionstatechange():
             logging.info(f"Connection state is {self.pc.connectionState}")
+            if self.on_connection_state_change:
+                self.on_connection_state_change(self.pc.connectionState)
             if self.pc.connectionState == "failed":
                 await self.close()
+            elif self.pc.connectionState == "closed":
+                self.stop_keep_alive()
 
     def _register_channel_callbacks(self):
         """Registers the on-message callback for the data channel."""
@@ -44,6 +53,7 @@ class P2PConnection:
         logging.info("Creating data channel 'main'.")
         self.data_channel = self.pc.createDataChannel("main")
         self._register_channel_callbacks()
+        self.start_keep_alive()
 
         logging.info("Creating WebRTC offer.")
         offer = await self.pc.createOffer()
@@ -78,8 +88,28 @@ class P2PConnection:
         else:
             logging.warning("Cannot send message: Data channel is not open.")
 
+    def start_keep_alive(self):
+        if self.keep_alive_task is None:
+            self.keep_alive_task = asyncio.create_task(self._keep_alive_loop())
+
+    def stop_keep_alive(self):
+        if self.keep_alive_task:
+            self.keep_alive_task.cancel()
+            self.keep_alive_task = None
+
+    async def _keep_alive_loop(self):
+        while True:
+            await asyncio.sleep(5)
+            if self.data_channel and self.data_channel.readyState == "open":
+                if self.last_pong_received and time.time() - self.last_pong_received > 15:
+                    logging.warning("P2P connection timeout. Closing connection.")
+                    await self.close()
+                    break
+                self.send("ping")
+
     async def close(self):
         """Closes the peer connection."""
+        self.stop_keep_alive()
         if self.pc.connectionState != "closed":
             logging.info("Closing P2P connection.")
             await self.pc.close()

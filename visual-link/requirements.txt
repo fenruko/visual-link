@@ -8,3 +8,5 @@ uvicorn
 numpy
 av
 fastapi
+pystray
+Pillow
