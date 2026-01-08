@@ -10,6 +10,11 @@ PROXY_DATA_PREFIX = "p2p_proxy_data:"
 PROXY_CONN_OPEN = "p2p_proxy_conn_open"
 PROXY_CONN_CLOSE = "p2p_proxy_conn_close"
 
+# New prefixes for simplified proxy setup
+PROXY_SETUP_HOST = "proxy_setup_host"  # Peer is the game host, we should listen
+PROXY_SETUP_JOIN = "proxy_setup_join"  # Peer is joining, they will listen
+
+
 class TrafficForwarder:
     """
     Manages the forwarding of TCP traffic from a local port over a WebRTC data channel.

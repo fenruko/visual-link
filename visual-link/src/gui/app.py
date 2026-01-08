@@ -24,7 +24,7 @@ class App(ctk.CTk):
         self.async_thread = None
         self.host_password = None
         
-        self.offer_queue = asyncio.Queue()
+        self.answer_queue = asyncio.Queue()
 
         # ---- App Setup ----
         self.title("Visual Link")
@@ -108,32 +108,35 @@ class App(ctk.CTk):
     def _configure_proxy_tab(self):
         proxy_tab = self.tab_view.tab("Proxy")
         proxy_tab.grid_columnconfigure(0, weight=1)
+        proxy_tab.grid_rowconfigure(2, weight=1)
 
-        info_label = ctk.CTkLabel(proxy_tab, text="The proxy forwards traffic from a local port to the remote peer.\n" "This is how you play LAN games over the internet.",
+        info_label = ctk.CTkLabel(proxy_tab, 
+                                  text="Once connected to a peer, choose your role in the game and set the game's port.\n"
+                                       "This will automatically configure the proxy for both players.",
                                   wraplength=400, justify="left")
-        info_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        info_label.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
 
         config_frame = ctk.CTkFrame(proxy_tab)
         config_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
         config_frame.grid_columnconfigure(1, weight=1)
 
-        # --- User plays game on this machine ---
-        ctk.CTkLabel(config_frame, text="If you are PLAYING a game on this PC:", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=2, padx=10, pady=(10,0), sticky="w")
-        ctk.CTkLabel(config_frame, text="Your Game Connects To:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-        self.local_listen_port_entry = ctk.CTkEntry(config_frame, placeholder_text="e.g., 7777")
-        self.local_listen_port_entry.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+        ctk.CTkLabel(config_frame, text="Game's LAN Port:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.game_port_entry = ctk.CTkEntry(config_frame, placeholder_text="e.g., 7777 or 25565")
+        self.game_port_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+        button_frame = ctk.CTkFrame(proxy_tab, fg_color="transparent")
+        button_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
+        button_frame.grid_columnconfigure((0, 1), weight=1)
+
+        self.host_game_button = ctk.CTkButton(button_frame, text="I am HOSTING the game", command=self._start_proxy_as_host)
+        self.host_game_button.grid(row=0, column=0, padx=5, pady=10, sticky="ew")
+
+        self.join_game_button = ctk.CTkButton(button_frame, text="I am JOINING the game", command=self._start_proxy_as_joiner)
+        self.join_game_button.grid(row=0, column=1, padx=5, pady=10, sticky="ew")
         
-        # --- User hosts game on this machine ---
-        ctk.CTkLabel(config_frame, text="If you are HOSTING a game server on this PC:", font=ctk.CTkFont(weight="bold")).grid(row=2, column=0, columnspan=2, padx=10, pady=(15,0), sticky="w")
-        ctk.CTkLabel(config_frame, text="Game Server Address:").grid(row=3, column=0, padx=10, pady=5, sticky="w")
-        self.target_host_entry = ctk.CTkEntry(config_frame, placeholder_text="127.0.0.1 (usually)")
-        self.target_host_entry.grid(row=3, column=1, padx=10, pady=5, sticky="ew")
-        ctk.CTkLabel(config_frame, text="Game Server Port:").grid(row=4, column=0, padx=10, pady=5, sticky="w")
-        self.target_port_entry = ctk.CTkEntry(config_frame, placeholder_text="e.g., 7777")
-        self.target_port_entry.grid(row=4, column=1, padx=10, pady=5, sticky="ew")
-        
-        self.proxy_button = ctk.CTkButton(proxy_tab, text="Start Proxy", command=self.start_proxy)
-        self.proxy_button.grid(row=2, column=0, padx=10, pady=20, sticky="ew")
+        # This button will be controlled programmatically
+        self.proxy_stop_button = ctk.CTkButton(proxy_tab, text="Stop Proxy", command=self.stop_proxy, state="disabled")
+        self.proxy_stop_button.grid(row=3, column=0, padx=10, pady=20, sticky="ew")
 
     def _configure_chat_tab(self):
         chat_tab = self.tab_view.tab("Chat")
@@ -169,15 +172,36 @@ class App(ctk.CTk):
         if message.startswith(PROXY_DATA_PREFIX):
             if self.traffic_forwarder:
                 self.traffic_forwarder.handle_p2p_proxy_message(message)
+        
+        elif message.startswith(PROXY_SETUP_HOST):
+            # The peer told us they are hosting the game. We need to set up a listener.
+            try:
+                _, port_str = message.split('|')
+                port = int(port_str)
+                self.run_async(self._setup_proxy_as_joiner_peer(port))
+            except Exception as e:
+                self.update_status(f"Error starting proxy for host: {e}")
+
+        elif message.startswith(PROXY_SETUP_JOIN):
+            # The peer told us they are joining. We need to connect to our local game server.
+            try:
+                _, port_str = message.split('|')
+                port = int(port_str)
+                self.run_async(self._setup_proxy_as_host_peer(port))
+            except Exception as e:
+                self.update_status(f"Error starting proxy for joiner: {e}")
+
         elif message.startswith(PROXY_CONN_OPEN):
             parts = message.split('|')
             if len(parts) == 3:
                 _, host, port = parts
-                self.after(0, self.update_status, f"Peer is connecting to a game. Starting our connection to {host}:{port}...")
+                self.after(0, self.update_status, f"Peer's game client connected. Connecting to your local server at {host}:{port}...")
                 self.run_async(self.traffic_forwarder.connect_to_target(host, int(port)))
+        
         elif message == PROXY_CONN_CLOSE:
             self.after(0, self.update_status, "Peer's game connection closed. Stopping proxy.")
-            self.stop_proxy()
+            self.run_async(self.stop_proxy())
+        
         else:
             self.after(0, self.append_chat_message, "Peer", message)
 
@@ -207,37 +231,58 @@ class App(ctk.CTk):
         try:
             self.after(0, self.update_status, "Initializing P2P connection...")
             self.p2p_connection = P2PConnection(on_message_callback=self.handle_p2p_message)
+            
             offer = await self.p2p_connection.create_offer()
+            
             self.after(0, self.update_status, "Discovering public IP...")
             public_ip = await self.async_loop.run_in_executor(None, get_public_ip)
             if not public_ip:
                 raise ConnectionError("Could not determine public IP.")
+
             self.after(0, self.update_status, "Starting signaling server...")
-            self.signaling_server = SignalingServer(host_password=self.host_password, offer_queue=self.offer_queue, answer_func=self.get_host_answer)
+            self.signaling_server = SignalingServer(
+                host_offer=offer,
+                host_password=self.host_password,
+                answer_queue=self.answer_queue
+            )
             self.signaling_server.start(host="0.0.0.0", port=SIGNALING_PORT)
+            
             self.after(0, self.update_status, "Attempting UPnP port mapping...")
             if self.upnp_handler.discover():
                 if not self.upnp_handler.add_port_mapping(SIGNALING_PORT, SIGNALING_PORT):
                     self.after(0, self.update_status, f"Warning: UPnP map for {SIGNALING_PORT} failed. Manual forwarding may be needed.")
             else:
                  self.after(0, self.update_status, "Warning: No UPnP router found. Manual forwarding may be needed.")
-            invite_data = {"host_ip": public_ip, "port": SIGNALING_PORT, "offer": offer}
+
+            invite_data = {"host_ip": public_ip, "port": SIGNALING_PORT}
             invite_code = json.dumps(invite_data)
             self.after(0, self.display_invite_code, invite_code)
             self.is_hosting = True
+            
             self.after(0, self.update_status, "Waiting for a peer to connect...")
+            
+            # This will block until a peer sends its answer
+            await self.wait_for_peer_answer()
+
         except Exception as e:
             logging.error(f"Hosting setup failed: {e}")
             self.after(0, self.update_status, f"Error: {e}")
             await self.cleanup_hosting_resources()
-            
-    async def get_host_answer(self):
-        peer_offer = await self.offer_queue.get()
-        self.after(0, self.update_status, "Peer offer received, generating answer...")
-        answer = await self.p2p_connection.set_offer_and_create_answer(peer_offer)
+
+    async def wait_for_peer_answer(self):
+        """Waits for the peer's answer from the queue and completes the connection."""
+        peer_answer = await self.answer_queue.get()
+        self.after(0, self.update_status, "Peer answer received, establishing connection...")
+        
+        await self.p2p_connection.set_answer(peer_answer)
+        
         self.after(0, self.update_status, "Peer connected! Configure and start the proxy to play.")
         self.after(0, self.tab_view.set, "Proxy")
-        return answer
+        
+        # Clean up signaling server as it's no longer needed
+        if self.signaling_server:
+            self.signaling_server.stop()
+            self.signaling_server = None
 
     def display_invite_code(self, code):
         self.invite_code_box.configure(state="normal")
@@ -251,9 +296,7 @@ class App(ctk.CTk):
         self.run_async(self.cleanup_hosting_resources())
 
     async def cleanup_hosting_resources(self):
-        if self.traffic_forwarder:
-            await self.traffic_forwarder.stop()
-            self.traffic_forwarder = None
+        await self.stop_proxy()
         if self.p2p_connection:
             await self.p2p_connection.close()
             self.p2p_connection = None
@@ -268,7 +311,7 @@ class App(ctk.CTk):
         self.invite_code_box.configure(state="normal")
         self.invite_code_box.delete("1.0", "end")
         self.invite_code_box.configure(state="disabled")
-        self.generate_invite_button.configure(text="Start Hosting", command=self.start_hosting_flow)
+        self.generate_invite_button.configure(command=self.start_hosting_flow, state="normal", text="Start Hosting")
         self.update_status("Ready")
         self.is_hosting = False
         
@@ -288,22 +331,36 @@ class App(ctk.CTk):
 
     async def join_host(self, invite_data: dict, password: str):
         try:
+            client = SignalingClient()
+            
+            # --- Hairpinning/Loopback Correction ---
+            own_public_ip = await self.async_loop.run_in_executor(None, get_public_ip)
+            host_ip_to_use = invite_data['host_ip']
+            if own_public_ip == host_ip_to_use:
+                logging.info("Host IP is our own public IP. Using '127.0.0.1' for loopback connection.")
+                host_ip_to_use = "127.0.0.1"
+            
+            self.after(0, self.update_status, f"Fetching offer from {host_ip_to_use}...")
+            host_offer = await client.get_offer(host_ip=host_ip_to_use, port=invite_data["port"])
+            
             self.after(0, self.update_status, "Initializing P2P connection...")
             self.p2p_connection = P2PConnection(on_message_callback=self.handle_p2p_message)
+            
             self.after(0, self.update_status, "Received offer, creating answer...")
-            answer = await self.p2p_connection.set_offer_and_create_answer(invite_data["offer"])
-            self.after(0, self.update_status, f"Sending answer to {invite_data['host_ip']}...")
-            client = SignalingClient()
-            payload_as_offer = {"sdp": answer['sdp'], "type": answer['type']}
-            final_answer = await client.connect_and_exchange(
-                host_ip=invite_data["host_ip"],
+            answer = await self.p2p_connection.set_offer_and_create_answer(host_offer)
+            
+            self.after(0, self.update_status, f"Sending answer to {host_ip_to_use}...")
+            await client.send_answer(
+                host_ip=host_ip_to_use,
                 port=invite_data["port"],
                 password=password,
-                offer=payload_as_offer 
+                answer=answer
             )
+            
             self.after(0, self.update_status, "Peer connected! Configure and start the proxy to play.")
             self.after(0, self.connect_button.configure, {"state": "normal", "text": "Connect to Host"})
             self.after(0, self.tab_view.set, "Proxy")
+            
         except Exception as e:
             logging.error(f"Joining failed: {e}")
             self.after(0, self.update_status, f"Error: {e}")
@@ -312,45 +369,92 @@ class App(ctk.CTk):
                 await self.p2p_connection.close()
 
     # ---- PROXY LOGIC ----
-    def start_proxy(self):
-        if not self.p2p_connection or self.p2p_connection.pc.connectionState != 'connected':
-            self.update_status("Error: P2P connection not established.")
-            return
-            
-        listen_port_str = self.local_listen_port_entry.get()
-        target_host = self.target_host_entry.get()
-        target_port_str = self.target_port_entry.get()
-        
-        if not listen_port_str or not target_host or not target_port_str:
-            self.update_status("Error: All proxy fields are required.")
-            return
-            
+    def _get_game_port(self) -> int | None:
+        """Safely gets and validates the game port from the UI."""
         try:
-            listen_port = int(listen_port_str)
-            target_port = int(target_port_str)
-        except ValueError:
-            self.update_status("Error: Ports must be numbers.")
+            port = int(self.game_port_entry.get())
+            if 1 <= port <= 65535:
+                return port
+            self.update_status("Error: Port must be between 1 and 65535.")
+            return None
+        except (ValueError, TypeError):
+            self.update_status("Error: Invalid game port. Please enter a number.")
+            return None
+
+    def _start_proxy_as_host(self):
+        """User is hosting the game server. We tell the peer to listen."""
+        if not self.p2p_connection or self.p2p_connection.pc.connectionState != 'connected':
+            self.update_status("Error: Must be connected to a peer to start proxy.")
+            return
+        
+        port = self._get_game_port()
+        if not port:
             return
 
-        self.update_status("Starting traffic forwarder...")
+        # Tell the peer to start a listening server on their end on the game port
+        self.p2p_connection.send(f"{PROXY_SETUP_JOIN}|{port}")
+        self.run_async(self._setup_proxy_as_host_peer(port))
+
+    def _start_proxy_as_joiner(self):
+        """User is joining a game server. We will listen for their local game client."""
+        if not self.p2p_connection or self.p2p_connection.pc.connectionState != 'connected':
+            self.update_status("Error: Must be connected to a peer to start proxy.")
+            return
+
+        port = self._get_game_port()
+        if not port:
+            return
+            
+        # Tell the peer that we are going to be the one listening
+        self.p2p_connection.send(f"{PROXY_SETUP_HOST}|{port}")
+        self.run_async(self._setup_proxy_as_joiner_peer(port))
+
+    async def _setup_proxy_as_host_peer(self, game_port: int):
+        """
+        This is run on the game host's side.
+        It waits for a P2P message from the joiner's proxy, then connects to the local game server.
+        """
+        self.update_status("Proxy active: Waiting for joiner's game to connect...")
+        self.traffic_forwarder = TrafficForwarder(p2p_send_func=self.p2p_connection.send)
+        # We don't start a server, we wait for the PROXY_CONN_OPEN message
+        self.after(0, self._set_proxy_ui_state, True)
+
+    async def _setup_proxy_as_joiner_peer(self, game_port: int):
+        """
+        This is run on the game joiner's side.
+        It starts a local TCP server to listen for the joiner's actual game client.
+        """
+        self.update_status(f"Proxy active: Connect your game to 127.0.0.1:{game_port}")
         self.traffic_forwarder = TrafficForwarder(p2p_send_func=self.p2p_connection.send)
         
-        self.run_async(self.traffic_forwarder.start_local_server(
-            listen_port=listen_port,
-            target_host=target_host,
-            target_port=target_port
-        ))
-        
-        self.proxy_button.configure(text="Stop Proxy", command=self.stop_proxy)
-        self.update_status(f"Proxy active. Connect your game to 127.0.0.1:{listen_port}")
+        # The target host is the peer's machine, which for them is 127.0.0.1
+        await self.traffic_forwarder.start_local_server(
+            listen_port=game_port,
+            target_host="127.0.0.1",
+            target_port=game_port
+        )
+        self.after(0, self._set_proxy_ui_state, True)
 
-    def stop_proxy(self):
+    def _set_proxy_ui_state(self, is_running: bool):
+        """Enables or disables the proxy UI elements."""
+        if is_running:
+            self.host_game_button.configure(state="disabled")
+            self.join_game_button.configure(state="disabled")
+            self.game_port_entry.configure(state="disabled")
+            self.proxy_stop_button.configure(state="normal")
+        else:
+            self.host_game_button.configure(state="normal")
+            self.join_game_button.configure(state="normal")
+            self.game_port_entry.configure(state="normal")
+            self.proxy_stop_button.configure(state="disabled")
+            self.update_status("Proxy stopped.")
+
+    async def stop_proxy(self):
         if self.traffic_forwarder:
             self.update_status("Stopping traffic forwarder...")
-            self.run_async(self.traffic_forwarder.stop())
+            await self.traffic_forwarder.stop()
             self.traffic_forwarder = None
-            self.proxy_button.configure(text="Start Proxy", command=self.start_proxy)
-            self.update_status("Proxy stopped.")
+            self.after(0, self._set_proxy_ui_state, False)
             
     # ---- CHAT LOGIC ----
     def send_chat_message(self, event=None):
