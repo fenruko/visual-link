@@ -353,7 +353,10 @@ class App(ctk.CTk):
     async def setup_host(self):
         try:
             self.after(0, self.update_status, "Initializing P2P connection...")
-            self.p2p_connection = P2PConnection(on_message_callback=self.handle_p2p_message)
+            self.p2p_connection = P2PConnection(
+                on_message_callback=self.handle_p2p_message,
+                on_connection_state_change=self.handle_p2p_connection_state_change
+            )
             
             offer = await self.p2p_connection.create_offer()
             
@@ -385,6 +388,7 @@ class App(ctk.CTk):
             self.after(0, self.update_status, "Waiting for a peer to connect...")
             
             # This will block until a peer sends its answer
+            await asyncio.sleep(1)
             await self.wait_for_peer_answer()
 
         except Exception as e:
@@ -467,7 +471,10 @@ class App(ctk.CTk):
             host_offer = await client.get_offer(host_ip=host_ip_to_use, port=invite_data["port"])
             
             self.after(0, self.update_status, "Initializing P2P connection...")
-            self.p2p_connection = P2PConnection(on_message_callback=self.handle_p2p_message)
+            self.p2p_connection = P2PConnection(
+                on_message_callback=self.handle_p2p_message,
+                on_connection_state_change=self.handle_p2p_connection_state_change
+            )
             
             self.after(0, self.update_status, "Received offer, creating answer...")
             answer = await self.p2p_connection.set_offer_and_create_answer(host_offer)
@@ -600,11 +607,14 @@ class App(ctk.CTk):
         logging.info("Application closing...")
         if self.tray_icon:
             self.tray_icon.stop()
-        self.run_async(self.cleanup_hosting_resources())
+        
         if self.async_loop:
+            self.run_async(self.cleanup_hosting_resources())
             self.async_loop.call_soon_threadsafe(self.async_loop.stop)
-            self.async_thread.join(timeout=2)
-        self.destroy()
+            if self.async_thread and self.async_thread.is_alive():
+                self.async_thread.join(timeout=2)
+        
+        self.after(100, self.destroy) # Destroy after a short delay
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
@@ -613,5 +623,6 @@ if __name__ == '__main__':
     app = App()
     try:
         app.mainloop()
-    except KeyboardInterrupt:
-        app.quit_app()
+    finally:
+        if app.winfo_exists():
+            app.quit_app()

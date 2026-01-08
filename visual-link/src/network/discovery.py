@@ -49,6 +49,10 @@ class UPnPHandler:
             else:
                 logging.warning("No UPnP devices found on the network.")
                 return False
+        except IndexError:
+            logging.warning("UPnP discovery failed: Malformed response from router. Continuing without UPnP.")
+            self.device = None
+            return False
         except Exception as e:
             logging.error(f"UPnP discovery failed: {e}")
             self.device = None
